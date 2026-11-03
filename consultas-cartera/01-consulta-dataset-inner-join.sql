@@ -65,9 +65,10 @@ DROP TABLE IF EXISTS #ClienteUnico;
                 CASE WHEN Asignacion_Motivo = 'cartera' THEN 0 ELSE 1 END,
                 Asignacion_Motivo
         ) AS rn
-    FROM Resultados.dcli.dominioclientes
-    WHERE FechaCorte BETWEEN @FechaInicio AND @FechaFin
-      AND TipoPersona = 'PERSONA NATURAL'
+    FROM Resultados.dcli.dominioclientes c
+    INNER JOIN #Meses m
+            ON m.FechaCorte = c.FechaCorte
+    WHERE c.TipoPersona = 'PERSONA NATURAL'
 )
 SELECT
     ClienteKey,
@@ -148,20 +149,9 @@ SELECT
     FechaInicio,
     FechaFin
 INTO #EventosFecha
-FROM
-(
-    SELECT
-        Evento,
-        DuracionDias,
-        CodigoRegional,
-        CodigoDepartamento,
-        Descripcion,
-        TRY_CONVERT(DATE, FechaInicio, 103) AS FechaInicio,
-        TRY_CONVERT(DATE, FechaFin, 103) AS FechaFin
-    FROM Inteligencia_Comercial.dbo.EventosRelevantes
-) e
-WHERE e.FechaInicio <= @FechaFin
-  AND e.FechaFin >= @FechaInicio;
+FROM Inteligencia_Comercial.dbo.EventosRelevantes
+WHERE FechaInicio <= @FechaFin
+  AND FechaFin >= @FechaInicio;
 
 CREATE INDEX IX_EventosFecha_Regional
     ON #EventosFecha (CodigoRegional, FechaInicio, FechaFin);
@@ -361,6 +351,8 @@ SELECT
                                                   AS TieneEvento
 INTO #Dataset
 FROM Resultados.dcar.dominiocartera car
+INNER JOIN #Meses m
+        ON m.FechaCorte = car.FechaCorte
 INNER JOIN #ClienteUnico cli
         ON cli.ClienteKey = car.ClienteKey
        AND cli.FechaCorte = car.FechaCorte
@@ -376,8 +368,7 @@ LEFT JOIN Inteligencia_Comercial.dbo.clienteinfocred inf
 LEFT JOIN #EventosFecha eve
        ON eve.CodigoRegional = car.CodigoRegional
       AND car.FechaCorte BETWEEN eve.FechaInicio AND eve.FechaFin
-WHERE car.FechaCorte BETWEEN @FechaInicio AND @FechaFin
-  AND car.Producto = 'CARTERA'
+WHERE car.Producto = 'CARTERA'
   AND car.TipoBanca = 'BANCA MICROEMPRESA'
   AND car.EstadoCredito = 'VIGENTE'
   AND car.FrecuenciaPago = 'MENSUAL';
@@ -393,15 +384,3 @@ BEGIN
     SELECT *
     FROM #Dataset;
 END;
-
-
-/* 7. CONVERSION DE FECHAS DE EVENTOS */
-
-/*
-SELECT
-    FechaInicio AS FechaInicioOriginal,
-    TRY_CONVERT(DATE, FechaInicio, 103) AS FechaInicioDate,
-    FechaFin AS FechaFinOriginal,
-    TRY_CONVERT(DATE, FechaFin, 103) AS FechaFinDate
-FROM Inteligencia_Comercial.dbo.EventosRelevantes;
-*/
