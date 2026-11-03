@@ -1101,3 +1101,585 @@ SELECT
 FROM ClientesEntrenamiento e
 INNER JOIN ClientesValidacion v
         ON v.ClienteKey = e.ClienteKey;
+
+
+/*==============================================================
+  35. OBJETIVO FUTURO DE MORA
+
+  Calcula, a nivel cliente, si en el mes siguiente supera 30 dias de
+  mora. Este objetivo futuro evita utilizar informacion del mismo mes
+  que se quiere predecir.
+==============================================================*/
+
+;WITH ClienteMes AS
+(
+    SELECT
+        FechaCorte,
+        ClienteKey,
+        MAX(MaxDiasMoraMes) AS MoraDelMes
+    FROM #Dataset
+    WHERE FechaCorte BETWEEN @FechaInicio AND @FechaFin
+    GROUP BY FechaCorte, ClienteKey
+),
+ClienteConFuturo AS
+(
+    SELECT
+        FechaCorte,
+        ClienteKey,
+        MoraDelMes,
+        LEAD(FechaCorte) OVER
+            (PARTITION BY ClienteKey ORDER BY FechaCorte) AS FechaSiguiente,
+        LEAD(MoraDelMes) OVER
+            (PARTITION BY ClienteKey ORDER BY FechaCorte) AS MoraMesSiguiente
+    FROM ClienteMes
+)
+SELECT
+    FechaCorte AS FechaDeLasVariables,
+    EOMONTH(DATEADD(MONTH, 1, FechaCorte)) AS FechaDelObjetivo,
+    COUNT_BIG(*) AS TotalClientes,
+    SUM
+    (
+        CASE
+            WHEN FechaSiguiente = EOMONTH(DATEADD(MONTH, 1, FechaCorte))
+             AND MoraMesSiguiente IS NOT NULL
+            THEN CONVERT(BIGINT, 1)
+            ELSE 0
+        END
+    ) AS ClientesConObjetivoConocido,
+    SUM
+    (
+        CASE
+            WHEN FechaSiguiente = EOMONTH(DATEADD(MONTH, 1, FechaCorte))
+             AND MoraMesSiguiente > 30
+            THEN CONVERT(BIGINT, 1)
+            ELSE 0
+        END
+    ) AS ClientesConMoraMayor30SiguienteMes,
+    CONVERT
+    (
+        DECIMAL(6,2),
+        100.0 * SUM
+        (
+            CASE
+                WHEN FechaSiguiente = EOMONTH(DATEADD(MONTH, 1, FechaCorte))
+                 AND MoraMesSiguiente > 30
+                THEN 1.0
+                ELSE 0.0
+            END
+        )
+        / NULLIF
+        (
+            SUM
+            (
+                CASE
+                    WHEN FechaSiguiente = EOMONTH(DATEADD(MONTH, 1, FechaCorte))
+                     AND MoraMesSiguiente IS NOT NULL
+                    THEN 1.0
+                    ELSE 0.0
+                END
+            ),
+            0
+        )
+    ) AS PorcentajeObjetivoMora30
+FROM ClienteConFuturo
+WHERE FechaCorte < @FechaFin
+GROUP BY FechaCorte
+ORDER BY FechaCorte;
+
+
+/*==============================================================
+  36. CRECIMIENTO MENSUAL
+
+  Muestra la variacion porcentual de clientes, carteras y saldo frente
+  al mes anterior. En Excel funciona bien como grafico de lineas.
+==============================================================*/
+
+;WITH ResumenMes AS
+(
+    SELECT
+        FechaCorte,
+        COUNT_BIG(DISTINCT ClienteKey) AS Clientes,
+        COUNT_BIG(DISTINCT CarteraKey) AS Carteras,
+        SUM(CONVERT(DECIMAL(38,2), SaldoCreditoBs)) AS SaldoTotalBs
+    FROM #Dataset
+    WHERE FechaCorte BETWEEN @FechaInicio AND @FechaFin
+    GROUP BY FechaCorte
+),
+ResumenConAnterior AS
+(
+    SELECT
+        *,
+        LAG(Clientes) OVER (ORDER BY FechaCorte) AS ClientesMesAnterior,
+        LAG(Carteras) OVER (ORDER BY FechaCorte) AS CarterasMesAnterior,
+        LAG(SaldoTotalBs) OVER (ORDER BY FechaCorte) AS SaldoMesAnterior
+    FROM ResumenMes
+)
+SELECT
+    FechaCorte,
+    Clientes,
+    Carteras,
+    SaldoTotalBs,
+    CONVERT
+    (
+        DECIMAL(10,2),
+        100.0 * (Clientes - ClientesMesAnterior)
+        / NULLIF(ClientesMesAnterior, 0)
+    ) AS CrecimientoClientesPorcentaje,
+    CONVERT
+    (
+        DECIMAL(10,2),
+        100.0 * (Carteras - CarterasMesAnterior)
+        / NULLIF(CarterasMesAnterior, 0)
+    ) AS CrecimientoCarterasPorcentaje,
+    CONVERT
+    (
+        DECIMAL(10,2),
+        100.0 * (SaldoTotalBs - SaldoMesAnterior)
+        / NULLIF(SaldoMesAnterior, 0)
+    ) AS CrecimientoSaldoPorcentaje
+FROM ResumenConAnterior
+ORDER BY FechaCorte;
+
+
+/*==============================================================
+  37. ENTRADA, CONTINUIDAD Y REINGRESO DE CLIENTES
+
+  Permite entender si el cambio mensual proviene de clientes nuevos en
+  el rango, clientes continuos o clientes que reaparecen.
+==============================================================*/
+
+;WITH ClienteFecha AS
+(
+    SELECT DISTINCT FechaCorte, ClienteKey
+    FROM #Dataset
+    WHERE FechaCorte BETWEEN @FechaInicio AND @FechaFin
+),
+ClienteConAnterior AS
+(
+    SELECT
+        FechaCorte,
+        ClienteKey,
+        LAG(FechaCorte) OVER
+            (PARTITION BY ClienteKey ORDER BY FechaCorte) AS FechaAnterior
+    FROM ClienteFecha
+),
+ClienteClasificado AS
+(
+    SELECT
+        FechaCorte,
+        CASE
+            WHEN FechaAnterior IS NULL THEN N'PRIMERA APARICION EN EL RANGO'
+            WHEN FechaAnterior = EOMONTH(DATEADD(MONTH, -1, FechaCorte))
+                THEN N'CLIENTE CONTINUO'
+            ELSE N'CLIENTE QUE REAPARECE'
+        END AS TipoPermanencia
+    FROM ClienteConAnterior
+)
+SELECT
+    FechaCorte,
+    TipoPermanencia,
+    COUNT_BIG(*) AS CantidadClientes,
+    CONVERT
+    (
+        DECIMAL(6,2),
+        100.0 * COUNT_BIG(*) / SUM(COUNT_BIG(*)) OVER (PARTITION BY FechaCorte)
+    ) AS PorcentajeClientes
+FROM ClienteClasificado
+GROUP BY FechaCorte, TipoPermanencia
+ORDER BY FechaCorte, TipoPermanencia;
+
+
+/*==============================================================
+  38. TRANSICION DE MORA ENTRE MESES
+
+  Muestra desde que banda de mora viene cada cliente y a cual pasa.
+  Se puede visualizar como matriz de calor o diagrama de flujo.
+==============================================================*/
+
+;WITH MoraClienteMes AS
+(
+    SELECT
+        FechaCorte,
+        ClienteKey,
+        MAX(MaxDiasMoraMes) AS MaxMoraDelMes
+    FROM #Dataset
+    WHERE FechaCorte BETWEEN @FechaInicio AND @FechaFin
+    GROUP BY FechaCorte, ClienteKey
+),
+BandaClienteMes AS
+(
+    SELECT
+        FechaCorte,
+        ClienteKey,
+        CASE
+            WHEN MaxMoraDelMes IS NULL THEN N'SIN DATO'
+            WHEN MaxMoraDelMes = 0 THEN N'0 DIAS'
+            WHEN MaxMoraDelMes <= 30 THEN N'1 A 30 DIAS'
+            WHEN MaxMoraDelMes <= 60 THEN N'31 A 60 DIAS'
+            WHEN MaxMoraDelMes <= 90 THEN N'61 A 90 DIAS'
+            ELSE N'MAS DE 90 DIAS'
+        END AS BandaActual
+    FROM MoraClienteMes
+),
+Transicion AS
+(
+    SELECT
+        FechaCorte,
+        ClienteKey,
+        BandaActual,
+        LAG(FechaCorte) OVER
+            (PARTITION BY ClienteKey ORDER BY FechaCorte) AS FechaAnterior,
+        LAG(BandaActual) OVER
+            (PARTITION BY ClienteKey ORDER BY FechaCorte) AS BandaAnterior
+    FROM BandaClienteMes
+)
+SELECT
+    FechaCorte,
+    BandaAnterior,
+    BandaActual,
+    COUNT_BIG(*) AS CantidadClientes,
+    CONVERT
+    (
+        DECIMAL(6,2),
+        100.0 * COUNT_BIG(*)
+        / SUM(COUNT_BIG(*)) OVER (PARTITION BY FechaCorte, BandaAnterior)
+    ) AS PorcentajeDesdeBandaAnterior
+FROM Transicion
+WHERE FechaAnterior = EOMONTH(DATEADD(MONTH, -1, FechaCorte))
+GROUP BY FechaCorte, BandaAnterior, BandaActual
+ORDER BY FechaCorte, BandaAnterior, BandaActual;
+
+
+/*==============================================================
+  39. EXPOSICION MONETARIA POR BANDA DE MORA
+
+  Complementa la cantidad de casos con el dinero expuesto en cada nivel
+  de riesgo. Es apropiado para columnas apiladas en Excel.
+==============================================================*/
+
+;WITH ExposicionMora AS
+(
+    SELECT
+        FechaCorte,
+        SaldoCreditoBs,
+        CASE
+            WHEN MaxDiasMora12M IS NULL THEN N'SIN DATO'
+            WHEN MaxDiasMora12M = 0 THEN N'0 DIAS'
+            WHEN MaxDiasMora12M <= 30 THEN N'1 A 30 DIAS'
+            WHEN MaxDiasMora12M <= 60 THEN N'31 A 60 DIAS'
+            WHEN MaxDiasMora12M <= 90 THEN N'61 A 90 DIAS'
+            ELSE N'MAS DE 90 DIAS'
+        END AS BandaMora
+    FROM #Dataset
+    WHERE FechaCorte BETWEEN @FechaInicio AND @FechaFin
+)
+SELECT
+    FechaCorte,
+    BandaMora,
+    COUNT_BIG(*) AS CantidadCarteras,
+    SUM(CONVERT(DECIMAL(38,2), SaldoCreditoBs)) AS SaldoExpuestoBs,
+    AVG(CONVERT(FLOAT, SaldoCreditoBs)) AS SaldoPromedioBs,
+    CONVERT
+    (
+        DECIMAL(6,2),
+        100.0 * SUM(CONVERT(DECIMAL(38,4), SaldoCreditoBs))
+        / NULLIF
+        (
+            SUM(SUM(CONVERT(DECIMAL(38,4), SaldoCreditoBs)))
+                OVER (PARTITION BY FechaCorte),
+            0
+        )
+    ) AS PorcentajeDelSaldo
+FROM ExposicionMora
+GROUP BY FechaCorte, BandaMora
+ORDER BY FechaCorte, BandaMora;
+
+
+/*==============================================================
+  40. CONCENTRACION DEL SALDO POR CLIENTE
+
+  Indica cuanto del saldo total esta concentrado en el 1, 5 y 10 por
+  ciento de clientes con mayor saldo.
+==============================================================*/
+
+;WITH SaldoCliente AS
+(
+    SELECT
+        FechaCorte,
+        ClienteKey,
+        SUM(CONVERT(DECIMAL(38,2), SaldoCreditoBs)) AS SaldoClienteBs
+    FROM #Dataset
+    WHERE FechaCorte BETWEEN @FechaInicio AND @FechaFin
+    GROUP BY FechaCorte, ClienteKey
+),
+ClienteOrdenado AS
+(
+    SELECT
+        FechaCorte,
+        ClienteKey,
+        SaldoClienteBs,
+        ROW_NUMBER() OVER
+            (PARTITION BY FechaCorte ORDER BY SaldoClienteBs DESC) AS Posicion,
+        COUNT_BIG(*) OVER (PARTITION BY FechaCorte) AS TotalClientes,
+        SUM(SaldoClienteBs) OVER (PARTITION BY FechaCorte) AS SaldoTotalBs
+    FROM SaldoCliente
+)
+SELECT
+    FechaCorte,
+    MAX(TotalClientes) AS TotalClientes,
+    MAX(SaldoTotalBs) AS SaldoTotalBs,
+    CONVERT
+    (
+        DECIMAL(6,2),
+        100.0 * SUM
+        (
+            CASE WHEN Posicion <= CEILING(TotalClientes * 0.01)
+                 THEN SaldoClienteBs ELSE 0 END
+        ) / NULLIF(MAX(SaldoTotalBs), 0)
+    ) AS PorcentajeSaldoTop1,
+    CONVERT
+    (
+        DECIMAL(6,2),
+        100.0 * SUM
+        (
+            CASE WHEN Posicion <= CEILING(TotalClientes * 0.05)
+                 THEN SaldoClienteBs ELSE 0 END
+        ) / NULLIF(MAX(SaldoTotalBs), 0)
+    ) AS PorcentajeSaldoTop5,
+    CONVERT
+    (
+        DECIMAL(6,2),
+        100.0 * SUM
+        (
+            CASE WHEN Posicion <= CEILING(TotalClientes * 0.10)
+                 THEN SaldoClienteBs ELSE 0 END
+        ) / NULLIF(MAX(SaldoTotalBs), 0)
+    ) AS PorcentajeSaldoTop10
+FROM ClienteOrdenado
+GROUP BY FechaCorte
+ORDER BY FechaCorte;
+
+
+/*==============================================================
+  41. ACTIVIDAD TRANSACCIONAL Y MORA
+
+  Permite revisar si clientes con poca o mucha actividad presentan
+  comportamientos de pago diferentes.
+==============================================================*/
+
+;WITH ActividadAgrupada AS
+(
+    SELECT
+        FechaCorte,
+        SaldoCreditoBs,
+        MaxDiasMora12M,
+        CASE
+            WHEN CantidadTrx IS NULL THEN N'SIN DATO'
+            WHEN CantidadTrx = 0 THEN N'SIN TRANSACCIONES'
+            WHEN CantidadTrx <= 5 THEN N'1 A 5'
+            WHEN CantidadTrx <= 20 THEN N'6 A 20'
+            WHEN CantidadTrx <= 50 THEN N'21 A 50'
+            ELSE N'MAS DE 50'
+        END AS BandaActividad
+    FROM #Dataset
+    WHERE FechaCorte BETWEEN @FechaInicio AND @FechaFin
+)
+SELECT
+    FechaCorte,
+    BandaActividad,
+    COUNT_BIG(*) AS CantidadCarteras,
+    AVG(CONVERT(FLOAT, SaldoCreditoBs)) AS SaldoPromedioBs,
+    CONVERT
+    (
+        DECIMAL(6,2),
+        100.0 * SUM(CASE WHEN MaxDiasMora12M > 30 THEN 1.0 ELSE 0.0 END)
+        / NULLIF(SUM(CASE WHEN MaxDiasMora12M IS NOT NULL THEN 1.0 ELSE 0.0 END), 0)
+    ) AS PorcentajeMoraMayor30
+FROM ActividadAgrupada
+GROUP BY FechaCorte, BandaActividad
+ORDER BY FechaCorte, BandaActividad;
+
+
+/*==============================================================
+  42. DECILES DE VARIABLES NUMERICAS
+
+  Evalua la relacion entre cada variable y la mora. Una tendencia clara
+  entre deciles indica posible capacidad predictiva.
+==============================================================*/
+
+;WITH VariablesNumericas AS
+(
+    SELECT
+        d.FechaCorte,
+        d.MaxDiasMora12M,
+        v.Variable,
+        v.Valor
+    FROM #Dataset d
+    CROSS APPLY
+    (
+        VALUES
+            (N'EdadCliente', CONVERT(FLOAT, d.EdadCliente)),
+            (N'AntiguedadClienteMeses', CONVERT(FLOAT, d.AntiguedadClienteMeses)),
+            (N'PatrimonioClienteBs', CONVERT(FLOAT, d.PatrimonioClienteBs)),
+            (N'SaldoCreditoBs', CONVERT(FLOAT, d.SaldoCreditoBs)),
+            (N'MontoDesembolsadoBs', CONVERT(FLOAT, d.MontoDesembolsadoBs)),
+            (N'TasaEfectivaCredito', CONVERT(FLOAT, d.TasaEfectivaCredito)),
+            (N'AntiguedadCreditoMeses', CONVERT(FLOAT, d.AntiguedadCreditoMeses)),
+            (N'CantidadTrx', CONVERT(FLOAT, d.CantidadTrx)),
+            (N'InfocredMontoDeudaTotalBs', CONVERT(FLOAT, d.InfocredMontoDeudaTotalBs))
+    ) v(Variable, Valor)
+    WHERE d.FechaCorte BETWEEN @FechaInicio AND @FechaFin
+      AND v.Valor IS NOT NULL
+),
+VariableConDecil AS
+(
+    SELECT
+        *,
+        NTILE(10) OVER
+        (
+            PARTITION BY FechaCorte, Variable
+            ORDER BY Valor
+        ) AS Decil
+    FROM VariablesNumericas
+)
+SELECT
+    FechaCorte,
+    Variable,
+    Decil,
+    COUNT_BIG(*) AS CantidadFilas,
+    MIN(Valor) AS ValorMinimo,
+    AVG(Valor) AS ValorPromedio,
+    MAX(Valor) AS ValorMaximo,
+    CONVERT
+    (
+        DECIMAL(6,2),
+        100.0 * SUM(CASE WHEN MaxDiasMora12M > 30 THEN 1.0 ELSE 0.0 END)
+        / NULLIF(SUM(CASE WHEN MaxDiasMora12M IS NOT NULL THEN 1.0 ELSE 0.0 END), 0)
+    ) AS PorcentajeMoraMayor30
+FROM VariableConDecil
+GROUP BY FechaCorte, Variable, Decil
+ORDER BY Variable, FechaCorte, Decil;
+
+
+/*==============================================================
+  43. ESTABILIDAD POBLACIONAL PSI
+
+  Compara la distribucion de cada mes contra el primer mes. Un PSI menor
+  a 0.10 suele ser estable; entre 0.10 y 0.25 requiere revision; mayor
+  a 0.25 indica un cambio importante de poblacion.
+==============================================================*/
+
+;WITH Categorias AS
+(
+    SELECT
+        d.FechaCorte,
+        c.Variable,
+        c.Valor,
+        COUNT_BIG(*) AS Cantidad
+    FROM #Dataset d
+    CROSS APPLY
+    (
+        VALUES
+            (N'GeneroCliente',
+                COALESCE(CONVERT(NVARCHAR(200), d.GeneroCliente), N'<NULO>')),
+            (N'DepartamentoCliente',
+                COALESCE(CONVERT(NVARCHAR(200), d.DepartamentoCliente), N'<NULO>')),
+            (N'SegmentoCliente',
+                COALESCE(CONVERT(NVARCHAR(200), d.SegmentoCliente), N'<NULO>')),
+            (N'NivelIngresoCliente',
+                COALESCE(CONVERT(NVARCHAR(200), d.NivelIngresoCliente), N'<NULO>')),
+            (N'TipoCredito',
+                COALESCE(CONVERT(NVARCHAR(200), d.TipoCredito), N'<NULO>'))
+    ) c(Variable, Valor)
+    WHERE d.FechaCorte BETWEEN @FechaInicio AND @FechaFin
+    GROUP BY d.FechaCorte, c.Variable, c.Valor
+),
+Distribucion AS
+(
+    SELECT
+        FechaCorte,
+        Variable,
+        Valor,
+        CONVERT
+        (
+            FLOAT,
+            Cantidad * 1.0 / SUM(Cantidad) OVER (PARTITION BY FechaCorte, Variable)
+        ) AS Proporcion
+    FROM Categorias
+),
+ValoresPosibles AS
+(
+    SELECT DISTINCT Variable, Valor
+    FROM Distribucion
+),
+Meses AS
+(
+    SELECT DISTINCT FechaCorte
+    FROM Distribucion
+),
+FechaBase AS
+(
+    SELECT MIN(FechaCorte) AS FechaBase
+    FROM Distribucion
+),
+Malla AS
+(
+    SELECT m.FechaCorte, v.Variable, v.Valor
+    FROM Meses m
+    CROSS JOIN ValoresPosibles v
+),
+Comparacion AS
+(
+    SELECT
+        g.FechaCorte,
+        fb.FechaBase,
+        g.Variable,
+        g.Valor,
+        CASE
+            WHEN ISNULL(actual.Proporcion, 0) < 0.000001 THEN 0.000001
+            ELSE actual.Proporcion
+        END AS ProporcionActual,
+        CASE
+            WHEN ISNULL(base.Proporcion, 0) < 0.000001 THEN 0.000001
+            ELSE base.Proporcion
+        END AS ProporcionBase
+    FROM Malla g
+    CROSS JOIN FechaBase fb
+    LEFT JOIN Distribucion actual
+           ON actual.FechaCorte = g.FechaCorte
+          AND actual.Variable = g.Variable
+          AND actual.Valor = g.Valor
+    LEFT JOIN Distribucion base
+           ON base.FechaCorte = fb.FechaBase
+          AND base.Variable = g.Variable
+          AND base.Valor = g.Valor
+)
+SELECT
+    FechaCorte,
+    MAX(FechaBase) AS FechaBase,
+    Variable,
+    CONVERT
+    (
+        DECIMAL(12,6),
+        SUM
+        (
+            (ProporcionActual - ProporcionBase)
+            * LOG(ProporcionActual / ProporcionBase)
+        )
+    ) AS PSI,
+    CASE
+        WHEN SUM
+        (
+            (ProporcionActual - ProporcionBase)
+            * LOG(ProporcionActual / ProporcionBase)
+        ) < 0.10 THEN N'ESTABLE'
+        WHEN SUM
+        (
+            (ProporcionActual - ProporcionBase)
+            * LOG(ProporcionActual / ProporcionBase)
+        ) < 0.25 THEN N'REVISAR'
+        ELSE N'CAMBIO IMPORTANTE'
+    END AS EstadoPSI
+FROM Comparacion
+GROUP BY FechaCorte, Variable
+ORDER BY Variable, FechaCorte;
